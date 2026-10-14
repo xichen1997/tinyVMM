@@ -15,6 +15,8 @@
 #include <cstring>
 #include <map>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 
 struct Region {
     uint64_t start;
@@ -56,7 +58,6 @@ constexpr bool all_in_memory() {
         if (r.end() > layout::MEM_SIZE) return false;
     return true;
 }
-
 
 
 class FD {
@@ -130,6 +131,34 @@ private:
 };
 
 
+
+class GuestMemory {
+    public:
+    GuestMemory(uint64_t size) : mem_(size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE) {}
+
+    std::span<uint8_t> span(uint64_t gpa, uint64_t len) const {
+        if (gpa > size() || len > size() - gpa)
+            throw std::out_of_range("guest memory access out of range");
+        return {static_cast<uint8_t*>(mem_.data()) + gpa, len};
+    }
+
+    void write(uint64_t gpa, const void* src, uint64_t len) {
+        std::memcpy(span(gpa, len).data(), src, len);
+    }
+
+    void read(uint64_t gpa, void* dst, uint64_t len) const {
+        std::memcpy(dst, span(gpa, len).data(), len);
+    }
+
+    void* host_addr() const { return mem_.data(); }
+    uint64_t size() const { return mem_.size(); }
+
+private:
+    Mmap mem_;
+};
+
+
+
 class KVM {
 public:
     KVM() : fd_(::open("/dev/kvm", O_RDWR | O_CLOEXEC)) {
@@ -148,8 +177,8 @@ private:
 class VM {
 public:
     VM(const KVM& kvm, size_t mem_size, uint64_t guest_addr)
-        : mem_(mem_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS),
-            fd_(::ioctl(kvm.get(), KVM_CREATE_VM, 0)) {
+        : mem_(mem_size),
+          fd_(::ioctl(kvm.get(), KVM_CREATE_VM, 0)) {
         if (fd_.get() < 0)
             throw std::system_error(errno, std::generic_category(), "KVM_CREATE_VM");
 
@@ -157,17 +186,17 @@ public:
             .slot = 0,
             .guest_phys_addr = guest_addr,
             .memory_size = mem_size,
-            .userspace_addr = reinterpret_cast<uint64_t>(mem_.data()),
+            .userspace_addr = reinterpret_cast<uint64_t>(mem_.host_addr()),
         };
         if (::ioctl(fd_.get(), KVM_SET_USER_MEMORY_REGION, &region) < 0)
             throw std::system_error(errno, std::generic_category(), "KVM_SET_USER_MEMORY_REGION");
     }
 
     int get() const { return fd_.get(); }
-    void* mem() const { return mem_.data(); }   // use to copy code to guest memory
+    GuestMemory& mem() { return mem_; }  // use to copy code to guest memory
 
 private:
-    Mmap mem_;  
+    GuestMemory mem_;
     FD fd_;
 };
 
@@ -233,7 +262,7 @@ int main(int argc, char** argv) {
 
     // Guest is in real mode. Code and string both live in CODE segment.
     // lodsb reads ds.base + si = CODE.start + 0x20.
-    auto* mem = reinterpret_cast<uint8_t*>(vm.mem());
+    auto* mem = reinterpret_cast<uint8_t*>(vm.mem().host_addr());
     std::strcpy(reinterpret_cast<char*>(mem + layout::CODE.start + 0x20), "Hello, World!");
 
     const uint8_t code[] = {
