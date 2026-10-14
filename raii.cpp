@@ -14,6 +14,50 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <cstdint>
+
+struct Region {
+    uint64_t start;
+    uint64_t size;
+    constexpr uint64_t end() const { return start + size; }
+};
+
+
+constexpr bool overlaps(Region a, Region b) {
+    return a.start < b.end() && b.start < a.end();
+}
+
+namespace layout {
+    constexpr uint64_t MEM_SIZE = 0x200000;
+
+    constexpr Region GDT  {0x500, 0x100};
+    constexpr Region PML4 {0x1000, 0x1000};
+    constexpr Region PDPT {0x2000, 0x1000};
+    constexpr Region PD   {0x3000, 0x1000};
+
+    constexpr Region CODE {0x10000, 0x10000};
+    constexpr Region STACK {0x30000, 0x10000};
+    constexpr Region ALL[] = {GDT, PML4, PDPT, PD, CODE, STACK};
+}
+
+constexpr bool no_overlaps() {
+    for(size_t i = 0; i < std::size(layout::ALL); i++) {
+        for(size_t j = i + 1; j < std::size(layout::ALL); j++) {
+            if(overlaps(layout::ALL[i], layout::ALL[j])){
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+constexpr bool all_in_memory() {
+    for (Region r : layout::ALL)
+        if (r.end() > layout::MEM_SIZE) return false;
+    return true;
+}
+
+
 
 class FD {
     private:
@@ -165,6 +209,14 @@ const char* exit_name(uint32_t reason) {
 }
 
 int main(int argc, char** argv) {
+    // static_assert to check the conditions
+    static_assert(no_overlaps(), "guest memory regions overlap");
+    static_assert(all_in_memory(), "region exceeds guest memory");
+    static_assert(layout::PML4.start % 0x1000 == 0, "page tables must be 4 KB aligned");
+    static_assert(layout::PDPT.start % 0x1000 == 0, "page tables must be 4 KB aligned");
+    static_assert(layout::PD.start   % 0x1000 == 0, "page tables must be 4 KB aligned");
+
+
     bool trace_exits = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace-exits") == 0)
@@ -176,17 +228,17 @@ int main(int argc, char** argv) {
     }
 
     KVM kvm;
-    VM vm(kvm, 0x1000, 0x1000);
+    VM vm(kvm, layout::MEM_SIZE, 0);
     VCPU vcpu(kvm, vm);
 
-    // Guest is in real mode. Bytes below are 16-bit code, not assembly text.
-    // Guest physical 0x1000 is mem()[0]. String sits at guest 0x1020.
+    // Guest is in real mode. Code and string both live in CODE segment.
+    // lodsb reads ds.base + si = CODE.start + 0x20.
     auto* mem = reinterpret_cast<uint8_t*>(vm.mem());
-    std::strcpy(reinterpret_cast<char*>(mem + 0x20), "Hello, World!");
+    std::strcpy(reinterpret_cast<char*>(mem + layout::CODE.start + 0x20), "Hello, World!");
 
     const uint8_t code[] = {
-        0xba, 0xf8, 0x04,       // mov $0x3f8, %dx
-        0xbe, 0x20, 0x10,       // mov $0x1020, %si
+        0xba, 0xf8, 0x03,       // mov $0x3f8, %dx
+        0xbe, 0x20, 0x00,       // mov $0x0020, %si
         0xb9, 0x0d, 0x00,       // mov $13, %cx
         0xac,                   // lodsb
         0xee,                   // out %al, (%dx)
@@ -195,20 +247,21 @@ int main(int argc, char** argv) {
         0xee,                   // out %al, (%dx)
         0xf4,                   // hlt
     };
-    std::memcpy(mem, code, sizeof(code));
+    std::memcpy(mem + layout::CODE.start, code, sizeof(code));
 
     kvm_sregs sregs{};
     if (ioctl(vcpu.get(), KVM_GET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_GET_SREGS");
-    sregs.cs.base = 0;
-    sregs.cs.selector = 0;
-    sregs.ds.base = 0;
-    sregs.ds.selector = 0;
+    sregs.cs.base = layout::CODE.start;          // 0x10000
+    sregs.cs.selector = layout::CODE.start >> 4; // base = selector × 16
+    sregs.ds.base = layout::CODE.start;          // data segment points to the same place, for reading the string
+    sregs.ds.selector = layout::CODE.start >> 4; // base = selector × 16
+
     if (ioctl(vcpu.get(), KVM_SET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_SREGS");
 
     kvm_regs regs{};
-    regs.rip = 0x1000;
+    regs.rip = 0; // shift to code segment which is 0.
     regs.rflags = 0x2;
     if (ioctl(vcpu.get(), KVM_SET_REGS, &regs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_REGS");
@@ -231,7 +284,7 @@ int main(int argc, char** argv) {
             ++exits[reason];
         switch (reason) {
         case KVM_EXIT_IO:
-            if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0x4f8)
+            if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0x3f8)
                 putchar(*((char*)state + state->io.data_offset));
             break;
         case KVM_EXIT_HLT:
