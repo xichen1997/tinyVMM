@@ -1,7 +1,0 @@
-/home/user/dev/build2/CMakeFiles/guest.dir
-/home/user/dev/build2/CMakeFiles/raii.dir
-/home/user/dev/build2/CMakeFiles/gdt_test.dir
-/home/user/dev/build2/CMakeFiles/run.dir
-/home/user/dev/build2/CMakeFiles/run-trace.dir
-/home/user/dev/build2/CMakeFiles/edit_cache.dir
-/home/user/dev/build2/CMakeFiles/rebuild_cache.dir

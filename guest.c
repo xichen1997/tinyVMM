@@ -17,6 +17,5 @@ static void hc_exit(unsigned char code) {
 
 void _start(void) {
     puts("Hello from C!\n");
-    // exit with code 0
-    hc_exit(0);
+    hc_exit(42);
 }
