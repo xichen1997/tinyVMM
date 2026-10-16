@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <fstream>
 #include "gdt.hpp"
 
 struct Region {
@@ -277,21 +278,16 @@ int main(int argc, char** argv) {
     // lodsb reads ds.base + si = CODE.start + 0x20.
 
     GuestMemory& mem = vm.mem();
-    mem.write(layout::CODE.start + 0x20, "Hello, World!");
 
-    // code in long mode
-    const uint8_t code[] = {
-        0x66, 0xba, 0xf8, 0x03,             // mov $0x3f8, %dx
-        0xbe, 0x20, 0x00, 0x01, 0x00,       // mov $0x10020, %esi
-        0xb9, 0x0d, 0x00, 0x00, 0x00,       // mov $13, %ecx
-        0xac,                               // lodsb
-        0xee,                               // out %al, (%dx)
-        0xe2, 0xfc,                         // loop lodsb
-        0xb0, '\n',                         // mov $'\n', %al
-        0xee,                               // out %al, (%dx)
-        0xf4,                               // hlt
-    };
-    std::memcpy(mem.span(layout::CODE.start, sizeof(code)).data(), code, sizeof(code));
+
+    // load guest code 
+    std::ifstream f("guest.bin", std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("Failed to open guest.bin");
+    }
+    std::vector<char> bin{std::istreambuf_iterator<char>(f), {}};
+    mem.write(layout::CODE.start, bin.data(), bin.size());
+    f.close();
 
     SegmentDesc code_desc{.limit = 0xFFFFF, .type = 0xA, .s = 1, .present = 1, .l = 1, .g = 1};
     SegmentDesc data_desc{.limit = 0xFFFFF, .type = 0x2, .s = 1, .present = 1, .db = 1, .g = 1};
@@ -350,10 +346,16 @@ int main(int argc, char** argv) {
         if (trace_exits)
             ++exits[reason];
         switch (reason) {
-        case KVM_EXIT_IO:
-            if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0x3f8)
-                putchar(*((char*)state + state->io.data_offset));
+        case KVM_EXIT_IO: {
+            uint8_t* data = (uint8_t*)state + state->io.data_offset;
+            if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0x3f8) {
+                putchar(*data);
+            } else if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0xf4) {
+                dump_exits();
+                return *data;
+            }
             break;
+        }
         case KVM_EXIT_HLT:
             std::puts("KVM_EXIT_HLT");
             dump_exits();
