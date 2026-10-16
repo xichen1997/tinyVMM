@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include "gdt.hpp"
 
 struct Region {
     uint64_t start;
@@ -141,13 +142,25 @@ class GuestMemory {
             throw std::out_of_range("guest memory access out of range");
         return {static_cast<uint8_t*>(mem_.data()) + gpa, len};
     }
-
+    
+    // write two versions
     void write(uint64_t gpa, const void* src, uint64_t len) {
         std::memcpy(span(gpa, len).data(), src, len);
     }
+    template <typename T>
+    void write(uint64_t gpa, const T& v) {
+        write(gpa, &v, sizeof(T));   
+    }
 
+    // read two versions
     void read(uint64_t gpa, void* dst, uint64_t len) const {
         std::memcpy(dst, span(gpa, len).data(), len);
+    }
+    template <typename T>
+    T read(uint64_t gpa) const {
+        T v;
+        read(gpa, &v, sizeof(T));   
+        return v;
     }
 
     void* host_addr() const { return mem_.data(); }
@@ -262,36 +275,60 @@ int main(int argc, char** argv) {
 
     // Guest is in real mode. Code and string both live in CODE segment.
     // lodsb reads ds.base + si = CODE.start + 0x20.
-    auto* mem = reinterpret_cast<uint8_t*>(vm.mem().host_addr());
-    std::strcpy(reinterpret_cast<char*>(mem + layout::CODE.start + 0x20), "Hello, World!");
 
+    GuestMemory& mem = vm.mem();
+    mem.write(layout::CODE.start + 0x20, "Hello, World!");
+
+    // code in long mode
     const uint8_t code[] = {
-        0xba, 0xf8, 0x03,       // mov $0x3f8, %dx
-        0xbe, 0x20, 0x00,       // mov $0x0020, %si
-        0xb9, 0x0d, 0x00,       // mov $13, %cx
-        0xac,                   // lodsb
-        0xee,                   // out %al, (%dx)
-        0xe2, 0xfc,             // loop lodsb
-        0xb0, '\n',             // mov $'\n', %al
-        0xee,                   // out %al, (%dx)
-        0xf4,                   // hlt
+        0x66, 0xba, 0xf8, 0x03,             // mov $0x3f8, %dx
+        0xbe, 0x20, 0x00, 0x01, 0x00,       // mov $0x10020, %esi
+        0xb9, 0x0d, 0x00, 0x00, 0x00,       // mov $13, %ecx
+        0xac,                               // lodsb
+        0xee,                               // out %al, (%dx)
+        0xe2, 0xfc,                         // loop lodsb
+        0xb0, '\n',                         // mov $'\n', %al
+        0xee,                               // out %al, (%dx)
+        0xf4,                               // hlt
     };
-    std::memcpy(mem + layout::CODE.start, code, sizeof(code));
+    std::memcpy(mem.span(layout::CODE.start, sizeof(code)).data(), code, sizeof(code));
+
+    SegmentDesc code_desc{.limit = 0xFFFFF, .type = 0xA, .s = 1, .present = 1, .l = 1, .g = 1};
+    SegmentDesc data_desc{.limit = 0xFFFFF, .type = 0x2, .s = 1, .present = 1, .db = 1, .g = 1};
+
+    mem.write<uint64_t>(layout::GDT.start + 0,  0);              
+    mem.write<uint64_t>(layout::GDT.start + 8,  encode(code_desc));   
+    mem.write<uint64_t>(layout::GDT.start + 16, encode(data_desc));   
 
     kvm_sregs sregs{};
     if (ioctl(vcpu.get(), KVM_GET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_GET_SREGS");
-    sregs.cs.base = layout::CODE.start;          // 0x10000
-    sregs.cs.selector = layout::CODE.start >> 4; // base = selector × 16
-    sregs.ds.base = layout::CODE.start;          // data segment points to the same place, for reading the string
-    sregs.ds.selector = layout::CODE.start >> 4; // base = selector × 16
+
+    mem.write<uint64_t>(layout::PML4.start, layout::PDPT.start | 0x3);
+    mem.write<uint64_t>(layout::PDPT.start, layout::PD.start | 0x3);
+    for (uint64_t i = 0; i < 512; i++)
+    mem.write<uint64_t>(layout::PD.start + i * 8, (i << 21) | 0x83);
+    // mem.write<uint64_t>(layout::PD.start, 0x83);
+
+    sregs.cr3  = layout::PML4.start;
+    sregs.cr4  = 1 << 5;                  // PAE (page address extension), which is required for long mode.
+    // Long mode is enabled by setting the Long Mode Enable (LME) and Long Mode Active (LMA) bits in the EFER register.
+    sregs.efer = (1 << 8) | (1 << 10);    // LME | LMA (Long Mode Enable | Long Mode Active)
+    sregs.cr0  = (1u << 31) | 1;          // PG | PE (Page Global Enable | Protection Enable)
+    sregs.gdt.base  = layout::GDT.start;
+    sregs.gdt.limit = 3 * 8 - 1;
+    sregs.cs = to_kvm_segment(code_desc, 0x08);   
+    sregs.ds = sregs.es = sregs.ss = to_kvm_segment(data_desc, 0x10);
+
 
     if (ioctl(vcpu.get(), KVM_SET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_SREGS");
 
     kvm_regs regs{};
-    regs.rip = 0; // shift to code segment which is 0.
-    regs.rflags = 0x2;
+    regs.rip = layout::CODE.start; // virtual address of code
+    regs.rsp = layout::STACK.end(); // virtual address of stack
+
+
     if (ioctl(vcpu.get(), KVM_SET_REGS, &regs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_REGS");
 
@@ -307,7 +344,8 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(count));
     };
     while (true) {
-        vcpu.run();
+        if (vcpu.run() < 0) 
+            throw std::system_error(errno, std::generic_category(), "KVM_RUN");
         uint32_t reason = state->exit_reason;
         if (trace_exits)
             ++exits[reason];

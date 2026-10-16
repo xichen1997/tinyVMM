@@ -200,10 +200,10 @@ int main(int argc, char** argv) {
     kvm_sregs sregs{};
     if (ioctl(vcpu.get(), KVM_GET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_GET_SREGS");
-    sregs.cs.base = 0;
-    sregs.cs.selector = 0;
-    sregs.ds.base = 0;
-    sregs.ds.selector = 0;
+
+    
+    sregs.cs = to_kvm_segment(code_desc, 0x08);
+    sregs.ds = sregs.es = sregs.ss = to_kvm_segment(data_desc, 0x10);
     if (ioctl(vcpu.get(), KVM_SET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_SREGS");
 
