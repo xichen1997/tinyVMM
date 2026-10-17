@@ -59,3 +59,14 @@ add_custom_target(run-trace
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
+
+# test.cpp
+add_executable(test_cpu test.cpp)
+target_compile_options(test_cpu PRIVATE -Wall -Wextra -g)
+
+add_custom_target(run-test-cpu
+    COMMAND $<TARGET_FILE:test_cpu>
+    DEPENDS test_cpu
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    USES_TERMINAL
+)
