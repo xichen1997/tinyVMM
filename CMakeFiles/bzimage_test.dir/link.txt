@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/bzimage_test.dir/bzimage_test.cpp.o -o bzimage_test 

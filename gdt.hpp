@@ -3,29 +3,21 @@
 #include <linux/kvm.h>
 #include <cstdint>
 
-// 一个段描述符的各个字段（拆开后的样子）
+// the fields of a segment descriptor (split apart)
 struct SegmentDesc {
-    uint32_t base = 0;     // 段起始地址（16 位）
-    uint32_t limit = 0;    // 段界限（20 位，单位由 g 决定）
-    uint8_t type = 0;      // 4 位：代码/数据、可读/可写、是否访问过
-    uint8_t s = 0;         // 1 = 代码或数据段，0 = 系统段（如 TSS）
-    uint8_t dpl = 0;       // 特权级 0~3 
-    uint8_t present = 0;   // 描述符是否有效
-    uint8_t avl = 0;       // 留给软件自用
-    uint8_t l = 0;         // 1 = 64 位代码段 
-    uint8_t db = 0;        // 1 = 32 位段
-    uint8_t g = 0;         // 1 = limit 以 4 KB 为单位
+    uint32_t base = 0;     // segment start address (16 bits)
+    uint32_t limit = 0;    // segment limit (20 bits, unit determined by g)
+    uint8_t type = 0;      // 4 bits: code/data, readable/writable, accessed
+    uint8_t s = 0;         // 1 = code or data segment, 0 = system segment (e.g. TSS)
+    uint8_t dpl = 0;       // privilege level 0~3
+    uint8_t present = 0;   // descriptor present
+    uint8_t avl = 0;       //留给 software use
+    uint8_t l = 0;         // 1 = 64 bit code segment
+    uint8_t db = 0;        // 1 = 32 bit segment
+    uint8_t g = 0;         // 1 = limit is in 4 KB units
 };
 
-// 字段 → 8 字节描述符
-//
-// 位布局（Intel SDM 规定，字段被拆散在不同位置，这是历史原因）：
-//   0-15  limit[0:15]      16-39 base[0:23]
-//   40-43 type             44    s
-//   45-46 dpl              47    present
-//   48-51 limit[16:19]     52    avl
-//   53    l                54    db
-//   55    g                56-63 base[24:31]
+// field → 8 byte descriptor
 inline uint64_t encode(const SegmentDesc& d) {
     uint64_t v = 0;
     v |= uint64_t(d.limit & 0xFFFF);                 // lower 16 bits of limit
@@ -43,7 +35,7 @@ inline uint64_t encode(const SegmentDesc& d) {
     return v;
 }
 
-// 8 字节描述符 → 字段（encode 的逆操作）
+// 8 byte descriptor → field (the inverse of encode)
 inline SegmentDesc decode(uint64_t v) {
     SegmentDesc d;
     d.limit   = uint32_t(v & 0xFFFF) | uint32_t((v >> 48) & 0xF) << 16;
@@ -59,12 +51,12 @@ inline SegmentDesc decode(uint64_t v) {
     return d;
 }
 
-// 字段 → KVM 的段寄存器（也就是 CPU 从 GDT 读出后缓存的样子）
-// selector 是这个段在 GDT 里的选择子，例如索引 1 → 0x08
+// field → KVM segment register (the way CPU reads from GDT)
+// selector is the index of the segment in GDT, e.g. index 1 → 0x08
 inline kvm_segment to_kvm_segment(const SegmentDesc& d, uint16_t selector) {
     kvm_segment s{};
     s.base = d.base;
-    // kvm_segment.limit 以字节为单位：g = 1 时要换算成 (limit << 12) | 0xFFF
+    // kvm_segment.limit is in bytes: if g = 1, then convert to (limit << 12) | 0xFFF
     s.limit = d.g ? (d.limit << 12) | 0xFFF : d.limit;
     s.selector = selector;
     s.type = d.type;

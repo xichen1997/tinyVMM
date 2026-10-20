@@ -70,3 +70,28 @@ add_custom_target(run-test-cpu
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
+
+
+# bzimage_test.cpp
+
+add_executable(bzimage_test bzimage_test.cpp)
+target_compile_options(bzimage_test PRIVATE -Wall -Wextra -g)
+
+add_custom_target(bzimage_test_run
+    COMMAND $<TARGET_FILE:bzimage_test>
+    DEPENDS bzimage_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    USES_TERMINAL
+)
+
+
+# boot_params.cpp
+add_executable(boot_params boot_params.cpp)
+target_compile_options(boot_params PRIVATE -Wall -Wextra -g)
+
+add_custom_target(boot_params_test
+    COMMAND $<TARGET_FILE:boot_params>
+    DEPENDS boot_params
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    USES_TERMINAL
+)

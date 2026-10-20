@@ -20,6 +20,11 @@
 #include <fstream>
 #include "gdt.hpp"
 
+
+// bzimage parser and boot_params builder
+#include "bzimage.hpp"
+#include "boot_params.hpp"
+
 struct Region {
     uint64_t start;
     uint64_t size;
@@ -32,7 +37,7 @@ constexpr bool overlaps(Region a, Region b) {
 }
 
 namespace layout {
-    constexpr uint64_t MEM_SIZE = 0x200000;
+    constexpr uint64_t MEM_SIZE = 256ull << 20; // 256 MiB, the kernel init_size needs 56 MB
 
     constexpr Region GDT  {0x500, 0x100};
     constexpr Region PML4 {0x1000, 0x1000};
@@ -40,8 +45,12 @@ namespace layout {
     constexpr Region PD   {0x3000, 0x1000};
 
     constexpr Region CODE {0x10000, 0x10000};
+    constexpr Region BOOT_PARAMS {0x7000, 0x1000};  // boot_params is at 0x7000
     constexpr Region STACK {0x30000, 0x10000};
-    constexpr Region ALL[] = {GDT, PML4, PDPT, PD, CODE, STACK};
+    constexpr Region CMDLINE {0x20000,  0x1000};  // cmdline is at 0x20000
+    constexpr Region KERNEL {0x100000, 0x4000000};  // kernel is at 0x100000, 64 MB is enough for the test case
+
+    constexpr Region ALL[] = {GDT, PML4, PDPT, PD, CODE, BOOT_PARAMS, STACK, CMDLINE, KERNEL};  // all regions  
 }
 
 constexpr bool no_overlaps() {
@@ -272,29 +281,59 @@ int main(int argc, char** argv) {
 
     KVM kvm;
     VM vm(kvm, layout::MEM_SIZE, 0);
+
+    // Linux needs an interrupt controller and a timer; KVM emulates them in the kernel.
+    // These must be created before the vCPU.
+    if (ioctl(vm.get(), KVM_SET_TSS_ADDR, 0xfffbd000) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_SET_TSS_ADDR");
+    if (ioctl(vm.get(), KVM_CREATE_IRQCHIP, 0) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_CREATE_IRQCHIP");
+    kvm_pit_config pit{};
+    if (ioctl(vm.get(), KVM_CREATE_PIT2, &pit) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_CREATE_PIT2");
+
+    // Create the vCPU.
     VCPU vcpu(kvm, vm);
 
-    // Guest is in real mode. Code and string both live in CODE segment.
-    // lodsb reads ds.base + si = CODE.start + 0x20.
+    // Set up the vCPU CPUID.
+    // Tell the guest which CPU features exist; without this Linux thinks there is no 64-bit.
+    //
+    // In C++, sizeof(kvm_cpuid2) is 12 (flex array quirks) but the kernel/C ABI is 8
+    // (nent + padding). Using the header macros then encodes the wrong ioctl size → EINVAL.
+    // Use a fixed layout + ioctl numbers with an 8-byte type instead.
+    struct Cpuid2 {
+        uint32_t nent;
+        uint32_t padding;
+        kvm_cpuid_entry2 entries[256];
+    } cpuid{};
+    cpuid.nent = 256;
+    constexpr auto GET_SUPPORTED_CPUID = _IOWR(KVMIO, 0x05, uint64_t);  // size 8
+    constexpr auto SET_CPUID2          = _IOW(KVMIO, 0x90, uint64_t);   // size 8
+    if (ioctl(kvm.get(), GET_SUPPORTED_CPUID, &cpuid) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_GET_SUPPORTED_CPUID");
+    if (ioctl(vcpu.get(), SET_CPUID2, &cpuid) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_SET_CPUID2");
+
 
     GuestMemory& mem = vm.mem();
 
+    // load kernel.bin
+    BzImage img = load_bzimage("kernel.bin");
+    std::string cmdline = "console=ttyS0 earlyprintk=serial pci=off";
 
-    // load guest code 
-    std::ifstream f("guest.bin", std::ios::binary);
-    if (!f) {
-        throw std::runtime_error("Failed to open guest.bin");
-    }
-    std::vector<char> bin{std::istreambuf_iterator<char>(f), {}};
-    mem.write(layout::CODE.start, bin.data(), bin.size());
-    f.close();
+    mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
+    mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
+
+    auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start);
+    mem.write(layout::BOOT_PARAMS.start, params.data(), params.size());
 
     SegmentDesc code_desc{.limit = 0xFFFFF, .type = 0xA, .s = 1, .present = 1, .l = 1, .g = 1};
     SegmentDesc data_desc{.limit = 0xFFFFF, .type = 0x2, .s = 1, .present = 1, .db = 1, .g = 1};
 
     mem.write<uint64_t>(layout::GDT.start + 0,  0);              
-    mem.write<uint64_t>(layout::GDT.start + 8,  encode(code_desc));   
-    mem.write<uint64_t>(layout::GDT.start + 16, encode(data_desc));   
+    mem.write<uint64_t>(layout::GDT.start + 8,  0);   
+    mem.write<uint64_t>(layout::GDT.start + 16, encode(data_desc)); // selector 0x10
+    mem.write<uint64_t>(layout::GDT.start + 24, encode(code_desc)); // selector 0x18
 
     kvm_sregs sregs{};
     if (ioctl(vcpu.get(), KVM_GET_SREGS, &sregs) < 0)
@@ -312,16 +351,17 @@ int main(int argc, char** argv) {
     sregs.efer = (1 << 8) | (1 << 10);    // LME | LMA (Long Mode Enable | Long Mode Active)
     sregs.cr0  = (1u << 31) | 1;          // PG | PE (Page Global Enable | Protection Enable)
     sregs.gdt.base  = layout::GDT.start;
-    sregs.gdt.limit = 3 * 8 - 1;
-    sregs.cs = to_kvm_segment(code_desc, 0x08);   
-    sregs.ds = sregs.es = sregs.ss = to_kvm_segment(data_desc, 0x10);
+    sregs.gdt.limit = 4 * 8 - 1;
+    sregs.cs = to_kvm_segment(code_desc, 0x10);   
+    sregs.ds = sregs.es = sregs.ss = to_kvm_segment(data_desc, 0x18);
 
 
     if (ioctl(vcpu.get(), KVM_SET_SREGS, &sregs) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_SREGS");
 
     kvm_regs regs{};
-    regs.rip = layout::CODE.start; // virtual address of code
+    regs.rip = layout::KERNEL.start + 0x200; // virtual address of kernel entry point, 64 bit mode requires 0x200 offset
+    regs.rsi = layout::BOOT_PARAMS.start;      // boot protocol: rsi = boot_params
     regs.rsp = layout::STACK.end(); // virtual address of stack
 
 
@@ -339,6 +379,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  %s (%u): %llu\n", exit_name(reason), reason,
                          static_cast<unsigned long long>(count));
     };
+    
     while (true) {
         if (vcpu.run() < 0) 
             throw std::system_error(errno, std::generic_category(), "KVM_RUN");
@@ -352,10 +393,13 @@ int main(int argc, char** argv) {
                 putchar(*data);
             } else if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0xf4) {
                 dump_exits();
-                return *data;
+            } else if (state->io.direction == KVM_EXIT_IO_IN) {
+                *data = (state->io.port == 0x3fd) ? 0x60 : 0;   // 0x3fd: transmitter empty
             }
             break;
         }
+        case KVM_EXIT_MMIO: 
+            break;
         case KVM_EXIT_HLT:
             std::puts("KVM_EXIT_HLT");
             dump_exits();
