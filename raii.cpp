@@ -18,12 +18,16 @@
 #include <span>
 #include <stdexcept>
 #include <fstream>
+#include <csignal>
 #include "gdt.hpp"
 
 
 // bzimage parser and boot_params builder
 #include "bzimage.hpp"
 #include "boot_params.hpp"
+
+
+static void on_sigint(int) {}   
 
 struct Region {
     uint64_t start;
@@ -288,7 +292,10 @@ int main(int argc, char** argv) {
         throw std::system_error(errno, std::generic_category(), "KVM_SET_TSS_ADDR");
     if (ioctl(vm.get(), KVM_CREATE_IRQCHIP, 0) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_CREATE_IRQCHIP");
+    // SPEAKER_DUMMY makes KVM also emulate port 0x61, which exposes PIT channel 2's output.
+    // Without it, Linux spins forever reading 0x61 during TSC calibration.
     kvm_pit_config pit{};
+    pit.flags = KVM_PIT_SPEAKER_DUMMY;
     if (ioctl(vm.get(), KVM_CREATE_PIT2, &pit) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_CREATE_PIT2");
 
@@ -314,12 +321,30 @@ int main(int argc, char** argv) {
     if (ioctl(vcpu.get(), SET_CPUID2, &cpuid) < 0)
         throw std::system_error(errno, std::generic_category(), "KVM_SET_CPUID2");
 
+    // No BIOS here to set up "virtual wire" mode, so do it ourselves:
+    // LINT0 receives PIC interrupts (ExtINT), LINT1 receives NMI.
+    kvm_lapic_state lapic{};
+    if (ioctl(vcpu.get(), KVM_GET_LAPIC, &lapic) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_GET_LAPIC");
+
+    auto set_delivery_mode = [&](size_t reg, uint32_t mode) {
+        uint32_t v;
+        std::memcpy(&v, lapic.regs + reg, sizeof(v));
+        v = (v & ~0x700u) | (mode << 8);              // bits 8-10: delivery mode
+        std::memcpy(lapic.regs + reg, &v, sizeof(v));
+    };
+    set_delivery_mode(0x350, 7);   // LVT LINT0 -> ExtINT
+    set_delivery_mode(0x360, 4);   // LVT LINT1 -> NMI
+
+    if (ioctl(vcpu.get(), KVM_SET_LAPIC, &lapic) < 0)
+        throw std::system_error(errno, std::generic_category(), "KVM_SET_LAPIC");
+
 
     GuestMemory& mem = vm.mem();
 
     // load kernel.bin
     BzImage img = load_bzimage("kernel.bin");
-    std::string cmdline = "console=ttyS0 earlyprintk=serial pci=off";
+    std::string cmdline = "console=ttyS0 earlyprintk=serial pci=off nokaslr panic=-1 reboot=t";
 
     mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
     mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
@@ -330,10 +355,10 @@ int main(int argc, char** argv) {
     SegmentDesc code_desc{.limit = 0xFFFFF, .type = 0xA, .s = 1, .present = 1, .l = 1, .g = 1};
     SegmentDesc data_desc{.limit = 0xFFFFF, .type = 0x2, .s = 1, .present = 1, .db = 1, .g = 1};
 
-    mem.write<uint64_t>(layout::GDT.start + 0,  0);              
-    mem.write<uint64_t>(layout::GDT.start + 8,  0);   
-    mem.write<uint64_t>(layout::GDT.start + 16, encode(data_desc)); // selector 0x10
-    mem.write<uint64_t>(layout::GDT.start + 24, encode(code_desc)); // selector 0x18
+    mem.write<uint64_t>(layout::GDT.start + 0,  0);
+    mem.write<uint64_t>(layout::GDT.start + 8,  0);
+    mem.write<uint64_t>(layout::GDT.start + 16, encode(code_desc)); // selector 0x10
+    mem.write<uint64_t>(layout::GDT.start + 24, encode(data_desc)); // selector 0x18
 
     kvm_sregs sregs{};
     if (ioctl(vcpu.get(), KVM_GET_SREGS, &sregs) < 0)
@@ -343,7 +368,6 @@ int main(int argc, char** argv) {
     mem.write<uint64_t>(layout::PDPT.start, layout::PD.start | 0x3);
     for (uint64_t i = 0; i < 512; i++)
     mem.write<uint64_t>(layout::PD.start + i * 8, (i << 21) | 0x83);
-    // mem.write<uint64_t>(layout::PD.start, 0x83);
 
     sregs.cr3  = layout::PML4.start;
     sregs.cr4  = 1 << 5;                  // PAE (page address extension), which is required for long mode.
@@ -379,10 +403,25 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  %s (%u): %llu\n", exit_name(reason), reason,
                          static_cast<unsigned long long>(count));
     };
+
+
+
+    // signal handler
+    struct sigaction sa{};
+    sa.sa_handler = on_sigint;   // without SA_RESTART, KVM_RUN will return EINTR
+    sigaction(SIGINT, &sa, nullptr);
     
     while (true) {
-        if (vcpu.run() < 0) 
-            throw std::system_error(errno, std::generic_category(), "KVM_RUN");
+        if (vcpu.run() < 0) {
+            if (errno != EINTR)
+                throw std::system_error(errno, std::generic_category(), "KVM_RUN");
+            kvm_regs r{};
+            ioctl(vcpu.get(), KVM_GET_REGS, &r);
+            std::fprintf(stderr, "\n[Ctrl-C] rip=%016llx rsp=%016llx\n", r.rip, r.rsp);
+            dump_exits();
+            continue;              
+        }
+
         uint32_t reason = state->exit_reason;
         if (trace_exits)
             ++exits[reason];
