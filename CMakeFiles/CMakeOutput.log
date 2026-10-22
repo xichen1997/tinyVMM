@@ -443,3 +443,38 @@ Parsed CXX implicit link information from above output:
   implicit fwks: []
 
 
+Performing C SOURCE FILE Test CMAKE_HAVE_LIBC_PTHREAD succeeded with the following output:
+Change Dir: /home/user/dev/CMakeFiles/CMakeScratch/TryCompile-yhmcEA
+
+Run Build Command(s):/usr/bin/gmake -f Makefile cmTC_7dc58/fast && /usr/bin/gmake  -f CMakeFiles/cmTC_7dc58.dir/build.make CMakeFiles/cmTC_7dc58.dir/build
+gmake[1]: Entering directory '/home/user/dev/CMakeFiles/CMakeScratch/TryCompile-yhmcEA'
+Building C object CMakeFiles/cmTC_7dc58.dir/src.c.o
+/usr/bin/cc -DCMAKE_HAVE_LIBC_PTHREAD   -o CMakeFiles/cmTC_7dc58.dir/src.c.o -c /home/user/dev/CMakeFiles/CMakeScratch/TryCompile-yhmcEA/src.c
+Linking C executable cmTC_7dc58
+/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_7dc58.dir/link.txt --verbose=1
+/usr/bin/cc CMakeFiles/cmTC_7dc58.dir/src.c.o -o cmTC_7dc58 
+gmake[1]: Leaving directory '/home/user/dev/CMakeFiles/CMakeScratch/TryCompile-yhmcEA'
+
+
+Source file was:
+#include <pthread.h>
+
+static void* test_func(void* data)
+{
+  return data;
+}
+
+int main(void)
+{
+  pthread_t thread;
+  pthread_create(&thread, NULL, test_func, NULL);
+  pthread_detach(thread);
+  pthread_cancel(thread);
+  pthread_join(thread, NULL);
+  pthread_atfork(NULL, NULL, NULL);
+  pthread_exit(NULL);
+
+  return 0;
+}
+
+

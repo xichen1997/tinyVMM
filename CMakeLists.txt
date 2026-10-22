@@ -40,6 +40,9 @@ add_executable(raii raii.cpp)
 target_compile_options(raii PRIVATE -Wall -Wextra -g)
 add_dependencies(raii guest)
 
+find_package(Threads REQUIRED)
+target_link_libraries(raii PRIVATE Threads::Threads)
+
 if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gdt_test.cpp)
     add_executable(gdt_test gdt_test.cpp)
     target_compile_options(gdt_test PRIVATE -Wall -Wextra -g)

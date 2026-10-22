@@ -19,12 +19,22 @@
 #include <stdexcept>
 #include <fstream>
 #include <csignal>
+#include <mutex>
+#include <thread>
+
+
 #include "gdt.hpp"
 
 
 // bzimage parser and boot_params builder
 #include "bzimage.hpp"
 #include "boot_params.hpp"
+
+// I/O bus
+#include "iobus.hpp"
+#include "serial8250.hpp"
+#include "terminal.hpp"
+#include "i8042.hpp"
 
 
 static void on_sigint(int) {}   
@@ -344,12 +354,24 @@ int main(int argc, char** argv) {
 
     // load kernel.bin
     BzImage img = load_bzimage("kernel.bin");
-    std::string cmdline = "console=ttyS0 earlyprintk=serial pci=off nokaslr panic=-1 reboot=t";
+    std::string cmdline = "console=ttyS0 reboot=k panic=1 pci=off rdinit=/bin/sh";
 
     mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
     mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
 
-    auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start);
+
+    // load initramfs.cpio.gz
+    std::ifstream f("initramfs.cpio.gz", std::ios::binary);
+    if (!f)
+        throw std::runtime_error("cannot open initramfs.cpio.gz");
+    std::vector<uint8_t> initrd{std::istreambuf_iterator<char>(f), {}};
+    uint64_t initrd_addr = (layout::MEM_SIZE - initrd.size()) & ~0xfffull;   // top of memory, 4 KiB aligned
+    mem.write(initrd_addr, initrd.data(), initrd.size());
+
+    auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start,
+                                    initrd_addr, initrd.size());
+
+
     mem.write(layout::BOOT_PARAMS.start, params.data(), params.size());
 
     SegmentDesc code_desc{.limit = 0xFFFFF, .type = 0xA, .s = 1, .present = 1, .l = 1, .g = 1};
@@ -404,7 +426,45 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(count));
     };
 
+    // COM1 serial port, all port accesses go through IoBus
+    Serial8250 serial;
+    IoBus io;
+    io.add(0x3f8, 8, &serial);
 
+    I8042 kbd;
+    io.add(0x60, 5, &kbd);   // 0x60 ~ 0x64; 0x61 is handled by KVM in the kernel, so it won't reach here
+
+    // input thread and vCPU loop both access the serial port, use a lock to chain them
+    std::mutex dev_lock;
+    bool irq4 = false;
+    auto update_irq = [&] {                   // must hold dev_lock when calling
+        bool level = serial.irq_pending();
+        if (level == irq4)
+            return;
+        kvm_irq_level line{};
+        line.irq = 4;                         // COM1 uses IRQ 4
+        line.level = level;
+        if (ioctl(vm.get(), KVM_IRQ_LINE, &line) < 0)
+            throw std::system_error(errno, std::generic_category(), "KVM_IRQ_LINE");
+        irq4 = level;
+    };
+
+    // set stdin to raw mode, each key is directly passed to the guest. press Ctrl-A then x to exit.
+    RawTerminal term;
+    std::thread([&] {
+        bool ctrl_a = false;
+        uint8_t c;
+        while (::read(STDIN_FILENO, &c, 1) == 1) {
+            if (ctrl_a && c == 'x') {
+                term.restore();
+                std::_Exit(0);
+            }
+            ctrl_a = (c == 0x01);
+            std::lock_guard<std::mutex> g(dev_lock);
+            serial.push_input(c);
+            update_irq();
+        }
+    }).detach();
 
     // signal handler
     struct sigaction sa{};
@@ -427,13 +487,13 @@ int main(int argc, char** argv) {
             ++exits[reason];
         switch (reason) {
         case KVM_EXIT_IO: {
-            uint8_t* data = (uint8_t*)state + state->io.data_offset;
-            if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0x3f8) {
-                putchar(*data);
-            } else if (state->io.direction == KVM_EXIT_IO_OUT && state->io.port == 0xf4) {
+            std::lock_guard<std::mutex> g(dev_lock);
+            io.handle(state);
+            update_irq();
+            if (kbd.reset_requested()) {
+                std::fprintf(stderr, "\n[vmm] guest requested reset, exiting\n");
                 dump_exits();
-            } else if (state->io.direction == KVM_EXIT_IO_IN) {
-                *data = (state->io.port == 0x3fd) ? 0x60 : 0;   // 0x3fd: transmitter empty
+                return 0;
             }
             break;
         }
@@ -441,6 +501,10 @@ int main(int argc, char** argv) {
             break;
         case KVM_EXIT_HLT:
             std::puts("KVM_EXIT_HLT");
+            dump_exits();
+            return 0;
+        case KVM_EXIT_SHUTDOWN:
+            std::fprintf(stderr, "\n[vmm] guest shutdown (triple fault), exiting\n");
             dump_exits();
             return 0;
         default:
