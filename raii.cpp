@@ -11,7 +11,6 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
-#include <cstdint>
 #include <cstring>
 #include <map>
 #include <cstdint>
@@ -25,6 +24,7 @@
 
 #include "gdt.hpp"
 
+#include "guest_memory.hpp"
 
 // bzimage parser and boot_params builder
 #include "bzimage.hpp"
@@ -36,6 +36,11 @@
 #include "terminal.hpp"
 #include "i8042.hpp"
 
+// MMIO bus
+#include "mmiobus.hpp"
+
+// virtio, virtio already includes virtqueue.hpp
+#include "virtio.hpp"
 
 static void on_sigint(int) {}   
 
@@ -122,78 +127,6 @@ class FD {
         if (fd >= 0) ::close(fd); 
     }
 };
-
-class Mmap {
-public:
-    // fd pass -1 for anonymous mapping (e.g. guest memory)
-    Mmap(size_t size, int prot, int flags, int fd = -1) : size_(size) {
-        addr_ = ::mmap(nullptr, size, prot, flags, fd, 0);
-        if (addr_ == MAP_FAILED) {   // return MAP_FAILED on failure, not nullptr
-            throw std::system_error(errno, std::generic_category(), "mmap");
-        }
-    }
-    
-    ~Mmap() {
-        if (addr_) ::munmap(addr_, size_);
-    }
-    
-    // cannot copy: otherwise will munmap twice
-    Mmap(const Mmap&) = delete;
-    Mmap& operator=(const Mmap&) = delete;
-    
-    // can move: ownership is transferred to the new object, the old object is empty
-    Mmap(Mmap&& o) noexcept
-        : addr_(std::exchange(o.addr_, nullptr)), size_(std::exchange(o.size_, 0)) {}
-    
-    // get pointer to the mapped memory
-    void* data() const { return addr_; }
-    // get size of the mapped memory
-    size_t size() const { return size_; }
-    
-private:
-    void* addr_ = nullptr;
-    size_t size_ = 0;
-};
-
-
-
-class GuestMemory {
-    public:
-    GuestMemory(uint64_t size) : mem_(size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE) {}
-
-    std::span<uint8_t> span(uint64_t gpa, uint64_t len) const {
-        if (gpa > size() || len > size() - gpa)
-            throw std::out_of_range("guest memory access out of range");
-        return {static_cast<uint8_t*>(mem_.data()) + gpa, len};
-    }
-    
-    // write two versions
-    void write(uint64_t gpa, const void* src, uint64_t len) {
-        std::memcpy(span(gpa, len).data(), src, len);
-    }
-    template <typename T>
-    void write(uint64_t gpa, const T& v) {
-        write(gpa, &v, sizeof(T));   
-    }
-
-    // read two versions
-    void read(uint64_t gpa, void* dst, uint64_t len) const {
-        std::memcpy(dst, span(gpa, len).data(), len);
-    }
-    template <typename T>
-    T read(uint64_t gpa) const {
-        T v;
-        read(gpa, &v, sizeof(T));   
-        return v;
-    }
-
-    void* host_addr() const { return mem_.data(); }
-    uint64_t size() const { return mem_.size(); }
-
-private:
-    Mmap mem_;
-};
-
 
 
 class KVM {
@@ -395,7 +328,7 @@ int main(int argc, char** argv) {
     sregs.cr4  = 1 << 5;                  // PAE (page address extension), which is required for long mode.
     // Long mode is enabled by setting the Long Mode Enable (LME) and Long Mode Active (LMA) bits in the EFER register.
     sregs.efer = (1 << 8) | (1 << 10);    // LME | LMA (Long Mode Enable | Long Mode Active)
-    sregs.cr0  = (1u << 31) | 1;          // PG | PE (Page Global Enable | Protection Enable)
+    sregs.cr0  = (1u << 31) | 1;          // PG | PE (Paging Enable | Protection Enable)
     sregs.gdt.base  = layout::GDT.start;
     sregs.gdt.limit = 4 * 8 - 1;
     sregs.cs = to_kvm_segment(code_desc, 0x10);   
@@ -427,12 +360,17 @@ int main(int argc, char** argv) {
     };
 
     // COM1 serial port, all port accesses go through IoBus
-    Serial8250 serial;
+    // Serial8250 serial;
     IoBus io;
-    io.add(0x3f8, 8, &serial);
+
+    // TODO: remove this and use VirtioConsole instead
+    // io.add(0x3f8, 8, &serial);
 
     I8042 kbd;
     io.add(0x60, 5, &kbd);   // 0x60 ~ 0x64; 0x61 is handled by KVM in the kernel, so it won't reach here
+
+    // MMIO bus for the device that is not mapped to the guest memory
+    MmioBus mmio;
 
     // input thread and vCPU loop both access the serial port, use a lock to chain them
     std::mutex dev_lock;
@@ -497,8 +435,11 @@ int main(int argc, char** argv) {
             }
             break;
         }
-        case KVM_EXIT_MMIO: 
+        case KVM_EXIT_MMIO: {
+            std::lock_guard<std::mutex> g(dev_lock);
+            mmio.handle(state);
             break;
+        }
         case KVM_EXIT_HLT:
             std::puts("KVM_EXIT_HLT");
             dump_exits();
