@@ -51,7 +51,9 @@ struct VirtioDevice {
     virtual uint64_t features() = 0;                                // at least F_VERSION_1
     virtual int num_queues() = 0;
     virtual void read_config(uint64_t, uint8_t* data, uint32_t len) { std::memset(data, 0, len); }
-    virtual void process_queue(int q) = 0;                          // guest wrote QueueNotify
+    virtual bool process_queue(int q, Virtqueue<GuestMemory>& vq) = 0;  // process the queue
+    virtual void queue_disabled(int) = 0;
+    virtual void reset() = 0;                        // reset the device
     virtual ~VirtioDevice() = default;
 };
 
@@ -73,6 +75,12 @@ public:
     // after the device processed the request and updated the used ring,call:set the bit and raise the IRQ
     void signal_used() {
         interrupt_status_ |= 0x1;       // bit0 = queue has been updated
+        raise_irq_(true);
+    }
+
+    void needs_reset() {
+        status_ |= 0x40;            // DEVICE_NEEDS_RESET
+        interrupt_status_ |= 0x2;   // bit1 = config change, notify guest to read status
         raise_irq_(true);
     }
 
@@ -105,15 +113,38 @@ private:
             q.avail = 0;
             q.used = 0;
         }
+        dev_.reset();
         raise_irq_(false);
+    }
+
+    void handle_notify(uint32_t q) {
+        if (status_ & 0x40) return;                       // already broken, wait for guest reset
+        if (q >= uint32_t(dev_.num_queues())) return;     // device doesn't have this queue
+    
+        auto& vq = q_[q].vq;                              // must be a reference
+        if (!vq) return;                                  // queue not ready
+    
+        try {
+            if (dev_.process_queue(int(q), *vq))
+                signal_used();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[virtio] queue %u: %s\n", q, e.what());
+            needs_reset();
+        }
     }
 
     void set_queue_ready(bool ready) {
         if (ready) {
             // check if the queue number is valid
+            if (cur().ready) return; // queue is already(write ready = 1 twice) ready, we don't need to do anything
             if(cur().num == 0){
                 // print log 
                 std::fprintf(stderr, "[virtio] queue number is 0\n");
+                return;
+            }
+            if(queue_sel_ >= dev_.num_queues()){
+                // print log
+                std::fprintf(stderr, "[virtio] queue selector is out of range: %u\n", queue_sel_);
                 return;
             }
             if(cur().num > vmmio::QUEUE_SIZE || (cur().num & (cur().num - 1))){
@@ -123,6 +154,7 @@ private:
             }
             cur().vq.emplace(mem_, cur().num, cur().desc, cur().avail, cur().used);
         } else {
+            dev_.queue_disabled(queue_sel_);
             cur().vq.reset();
         }
         cur().ready = ready;
@@ -162,6 +194,11 @@ private:
             break;
         case vmmio::QUEUE_SEL:
             if (v < vmmio::MAX_QUEUES) queue_sel_ = v;
+            else {
+                // print log
+                std::fprintf(stderr, "[virtio] queue selector is out of range: %u\n", v);
+                return;
+            }
             break;
         case vmmio::QUEUE_NUM:   {
             if(v == 0 || v > vmmio::QUEUE_SIZE || (v & (v - 1))){
@@ -182,16 +219,14 @@ private:
         case vmmio::QUEUE_AVAIL_HIGH: set_hi(cur().avail, v); break;
         case vmmio::QUEUE_USED_LOW:   set_lo(cur().used, v);  break;
         case vmmio::QUEUE_USED_HIGH:  set_hi(cur().used, v);  break;
-        case vmmio::QUEUE_NOTIFY:
-            if (v < vmmio::MAX_QUEUES) dev_.process_queue(v);
-            break;
+        case vmmio::QUEUE_NOTIFY: handle_notify(v); break;
         case vmmio::INTERRUPT_ACK:
             interrupt_status_ &= ~v;
             if (interrupt_status_ == 0) raise_irq_(false);    // if cleared,lower the IRQ
             break;
         case vmmio::STATUS:
             if (v == 0) reset();
-            else        status_ = v;
+            else        status_ = v | (status_ & 0x40);
             std::fprintf(stderr, "[virtio] status = %#x\n", v);
             break;
         default: break;

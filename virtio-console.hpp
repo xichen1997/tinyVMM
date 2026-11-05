@@ -1,43 +1,78 @@
+#pragma once
 #include "virtio.hpp"
-#include "mmiobus.hpp"
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
+#include <vector>
 
+// virtio-console：queue 0 = rx, queue 1 = tx
 class VirtioConsole : public VirtioDevice {
-private:
-    uint32_t device_id_ = 3;
-    uint64_t features_ = 0;
-    int num_queues_ = 1;
-    uint8_t name[32] = "virtio-console";
-    uint8_t status = 0;
-    uint8_t max_vq_pairs = 1;
-    uint8_t num_vq_pairs = 1;
-    uint8_t queue_size = 128;
 public:
-    uint32_t device_id() override { return device_id_; }
-    uint64_t features() override { return features_; }
-    int num_queues() override { return num_queues_; }
-    void read_config(uint64_t offset, uint8_t* data, uint32_t len) override {
-        if (offset == 0) {
-            data[0] = 0;
-            data[1] = 0;
-            data[2] = 0;
-            data[3] = 0;
-        } else if (offset == 1) {
-            data[0] = 0;
-            data[1] = 0;
-        } else if (offset == 2) {
-            data[0] = 0;
-            data[1] = 0;
-        } else if (offset == 3) {
-            data[0] = 0;
-            data[1] = 0;
-        } else if (offset == 4) {
-            data[0] = 0;
-            data[1] = 0;
+    uint32_t device_id() override { return 3; }
+    uint64_t features() override { return vmmio::F_VERSION_1; }   // version 2 device must provide
+    int num_queues() override { return 2; }
+
+    // return true = put a used entry into the used ring, Transport needs to call signal_used
+    bool process_queue(int q, Virtqueue<GuestMemory>& vq) override {
+        if (q == 0) {               // guest has filled the rx empty buffer
+            rx_ = &vq;
+            return fill_rx();       // the input that has been buffered can now be sent in
+        }
+        if (q == 1) return drain_tx(vq);
+        return false;
     }
-}
-    void process_queue(int q) override {
-        std::cout << "VirtioConsole: process_queue(" << q << ")" << std::endl;
+
+    // stdin thread calls, must hold dev_lock before calling
+    bool push_input(const uint8_t* buf, size_t n) {
+        pending_.insert(pending_.end(), buf, buf + n);
+        return fill_rx();
     }
+
+    // Transport::reset() is called, the queue has been destroyed
+    void reset() override {
+        rx_ = nullptr;
+        pending_.clear();
+    }
+
+    void queue_disabled(int q) override {
+        if (q == 0) rx_ = nullptr;
+    }
+
+private:
+    bool drain_tx(Virtqueue<GuestMemory>& vq) {
+        bool used = false;
+        uint16_t head;
+        while (vq.pop_head(head)) {
+            for (const Buffer& b : vq.collect(head))
+                if (!b.writable)                       // tx data segment is read-only for the device
+                    std::fwrite(b.data, 1, b.len, stdout);
+            vq.push_used(head, 0);                     // the device didn't write to the guest, len = 0
+            used = true;
+        }
+        std::fflush(stdout);
+        return used;
+    }
+
+    bool fill_rx() {
+        if (!rx_) return false;                        // guest hasn't built the rx queue yet
+        bool used = false;
+        uint16_t head;
+        while (!pending_.empty() && rx_->pop_head(head)) {
+            uint32_t written = 0;
+            for (const Buffer& b : rx_->collect(head)) {
+                if (!b.writable) continue;
+                size_t n = std::min<size_t>(b.len, pending_.size());
+                std::memcpy(b.data, pending_.data(), n);
+                pending_.erase(pending_.begin(), pending_.begin() + n);
+                written += uint32_t(n);
+                if (pending_.empty()) break;
+            }
+            rx_->push_used(head, written);             // len = the number of bytes actually written
+            used = true;
+        }
+        return used;
+    }
+
+    Virtqueue<GuestMemory>* rx_ = nullptr;
+    std::vector<uint8_t> pending_;                     // the input that has been buffered but not sent to the guest
 };

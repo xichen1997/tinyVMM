@@ -41,6 +41,7 @@
 
 // virtio, virtio already includes virtqueue.hpp
 #include "virtio.hpp"
+#include "virtio-console.hpp"
 
 static void on_sigint(int) {}   
 
@@ -287,7 +288,7 @@ int main(int argc, char** argv) {
 
     // load kernel.bin
     BzImage img = load_bzimage("kernel.bin");
-    std::string cmdline = "console=ttyS0 reboot=k panic=1 pci=off rdinit=/bin/sh";
+    std::string cmdline = "console=hvc0 reboot=k panic=1 pci=off rdinit=/bin/sh virtio_mmio.device=4K@0xd0000000:5";
 
     mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
     mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
@@ -360,11 +361,11 @@ int main(int argc, char** argv) {
     };
 
     // COM1 serial port, all port accesses go through IoBus
-    // Serial8250 serial;
+    Serial8250 serial;
     IoBus io;
 
-    // TODO: remove this and use VirtioConsole instead
-    // io.add(0x3f8, 8, &serial);
+    // This is still needed for seeing the booting logs before virtio console is ready.
+    io.add(0x3f8, 8, &serial);
 
     I8042 kbd;
     io.add(0x60, 5, &kbd);   // 0x60 ~ 0x64; 0x61 is handled by KVM in the kernel, so it won't reach here
@@ -387,6 +388,22 @@ int main(int argc, char** argv) {
         irq4 = level;
     };
 
+    bool irq5 = false;
+    auto raise_irq5 = [&](bool level) {        // must hold dev_lock when calling
+        if (level == irq5)
+            return;
+        kvm_irq_level line{};
+        line.irq = 5;                          // virtio console uses IRQ 5
+        line.level = level;
+        if (ioctl(vm.get(), KVM_IRQ_LINE, &line) < 0)
+            throw std::system_error(errno, std::generic_category(), "KVM_IRQ_LINE");
+        irq5 = level;
+    };
+
+    VirtioConsole console;
+    VirtioMmioTransport transport_console(console, raise_irq5, mem);
+    mmio.add(0xd0000000, 0x1000, &transport_console);
+
     // set stdin to raw mode, each key is directly passed to the guest. press Ctrl-A then x to exit.
     RawTerminal term;
     std::thread([&] {
@@ -399,12 +416,17 @@ int main(int argc, char** argv) {
             }
             ctrl_a = (c == 0x01);
             std::lock_guard<std::mutex> g(dev_lock);
-            serial.push_input(c);
-            update_irq();
+            try {
+                if (console.push_input(&c, 1))
+                    transport_console.signal_used();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[virtio] rx: %s\n", e.what());
+                transport_console.needs_reset();
+            }
         }
     }).detach();
 
-    // signal handler
+    // signal handler8
     struct sigaction sa{};
     sa.sa_handler = on_sigint;   // without SA_RESTART, KVM_RUN will return EINTR
     sigaction(SIGINT, &sa, nullptr);
