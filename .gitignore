@@ -2,3 +2,9 @@ build/
 guest.bin
 a.out
 linux/
+# in-source CMake output (always build out of source: cmake -B build)
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json

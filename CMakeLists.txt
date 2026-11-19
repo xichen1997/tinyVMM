@@ -9,6 +9,10 @@ find_program(OBJCOPY NAMES objcopy llvm-objcopy REQUIRED)
 find_program(LD NAMES ld REQUIRED)
 
 set(GUEST_BIN ${CMAKE_CURRENT_BINARY_DIR}/guest.bin)
+set(GUEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/guest)
+
+# project headers are included as "<module>/<file>.hpp", rooted at src/
+set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # --- guest: freestanding C → ELF → flat binary (linked at 0x10000) ---
 add_custom_command(
@@ -16,10 +20,10 @@ add_custom_command(
     COMMAND ${CMAKE_C_COMPILER}
         -m64 -O2 -ffreestanding -nostdlib -mno-red-zone -fno-pic
         -fno-stack-protector
-        -c ${CMAKE_CURRENT_SOURCE_DIR}/guest.c
+        -c ${GUEST_DIR}/guest.c
         -o ${CMAKE_CURRENT_BINARY_DIR}/guest.o
     COMMAND ${LD}
-        -T ${CMAKE_CURRENT_SOURCE_DIR}/guest.ld
+        -T ${GUEST_DIR}/guest.ld
         -o ${CMAKE_CURRENT_BINARY_DIR}/guest.elf
         ${CMAKE_CURRENT_BINARY_DIR}/guest.o
     COMMAND ${OBJCOPY}
@@ -27,8 +31,8 @@ add_custom_command(
         ${CMAKE_CURRENT_BINARY_DIR}/guest.elf
         ${GUEST_BIN}
     DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/guest.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/guest.ld
+        ${GUEST_DIR}/guest.c
+        ${GUEST_DIR}/guest.ld
     COMMENT "Building guest.bin"
     VERBATIM
 )
@@ -36,15 +40,17 @@ add_custom_command(
 add_custom_target(guest ALL DEPENDS ${GUEST_BIN})
 
 # --- host VMM (loads ./guest.bin relative to cwd) ---
-add_executable(raii raii.cpp)
+add_executable(raii src/vmm/raii.cpp)
+target_include_directories(raii PRIVATE ${SRC_DIR})
 target_compile_options(raii PRIVATE -Wall -Wextra -g)
 add_dependencies(raii guest)
 
 find_package(Threads REQUIRED)
 target_link_libraries(raii PRIVATE Threads::Threads)
 
-if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gdt_test.cpp)
-    add_executable(gdt_test gdt_test.cpp)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdt_test.cpp)
+    add_executable(gdt_test tests/gdt_test.cpp)
+    target_include_directories(gdt_test PRIVATE ${SRC_DIR})
     target_compile_options(gdt_test PRIVATE -Wall -Wextra -g)
 endif()
 
@@ -63,8 +69,8 @@ add_custom_target(run-trace
     USES_TERMINAL
 )
 
-# test.cpp
-add_executable(test_cpu test.cpp)
+# tests/test.cpp
+add_executable(test_cpu tests/test.cpp)
 target_compile_options(test_cpu PRIVATE -Wall -Wextra -g)
 
 add_custom_target(run-test-cpu
@@ -75,9 +81,10 @@ add_custom_target(run-test-cpu
 )
 
 
-# bzimage_test.cpp
+# tests/bzimage_test.cpp
 
-add_executable(bzimage_test bzimage_test.cpp)
+add_executable(bzimage_test tests/bzimage_test.cpp)
+target_include_directories(bzimage_test PRIVATE ${SRC_DIR})
 target_compile_options(bzimage_test PRIVATE -Wall -Wextra -g)
 
 add_custom_target(bzimage_test_run
@@ -88,8 +95,9 @@ add_custom_target(bzimage_test_run
 )
 
 
-# boot_params.cpp
-add_executable(boot_params boot_params.cpp)
+# tests/boot_params.cpp
+add_executable(boot_params tests/boot_params.cpp)
+target_include_directories(boot_params PRIVATE ${SRC_DIR})
 target_compile_options(boot_params PRIVATE -Wall -Wextra -g)
 
 add_custom_target(boot_params_test
