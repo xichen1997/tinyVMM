@@ -52,13 +52,13 @@ add_custom_command(
 add_custom_target(guest ALL DEPENDS ${GUEST_BIN})
 
 # --- host VMM (loads ./guest.bin relative to cwd) ---
-add_executable(raii src/vmm/raii.cpp)
-target_include_directories(raii PRIVATE ${SRC_DIR})
-target_compile_options(raii PRIVATE -Wall -Wextra -g)
-add_dependencies(raii guest)
+add_executable(main src/vmm/main.cpp)
+target_include_directories(main PRIVATE ${SRC_DIR})
+target_compile_options(main PRIVATE -Wall -Wextra -g)
+add_dependencies(main guest)
 
 find_package(Threads REQUIRED)
-target_link_libraries(raii PRIVATE Threads::Threads)
+target_link_libraries(main PRIVATE Threads::Threads)
 
 if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdt_test.cpp)
     add_executable(gdt_test tests/gdt_test.cpp)
@@ -68,15 +68,15 @@ endif()
 
 # guest hc_exit(42) makes the host return 42; treat that as success for convenience targets
 add_custom_target(run
-    COMMAND $<TARGET_FILE:raii> || test $$? -eq 42
-    DEPENDS raii guest
+    COMMAND $<TARGET_FILE:main> || test $$? -eq 42
+    DEPENDS main guest
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
 
 add_custom_target(run-trace
-    COMMAND $<TARGET_FILE:raii> --trace-exits || test $$? -eq 42
-    DEPENDS raii guest
+    COMMAND $<TARGET_FILE:main> --trace-exits || test $$? -eq 42
+    DEPENDS main guest
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
