@@ -258,15 +258,16 @@ int main(int argc, char** argv) {
 
 
     // load initramfs.cpio.gz
-    std::ifstream f("initramfs.cpio.gz", std::ios::binary);
-    if (!f)
-        throw std::runtime_error("cannot open initramfs.cpio.gz");
-    std::vector<uint8_t> initrd{std::istreambuf_iterator<char>(f), {}};
-    uint64_t initrd_addr = (layout::MEM_SIZE - initrd.size()) & ~0xfffull;   // top of memory, 4 KiB aligned
-    mem.write(initrd_addr, initrd.data(), initrd.size());
+    // std::ifstream f("initramfs.cpio.gz", std::ios::binary);
+    // if (!f)
+    //     throw std::runtime_error("cannot open initramfs.cpio.gz");
+    // std::vector<uint8_t> initrd{std::istreambuf_iterator<char>(f), {}};
+    // uint64_t initrd_addr = (layout::MEM_SIZE - initrd.size()) & ~0xfffull;   // top of memory, 4 KiB aligned
+    // mem.write(initrd_addr, initrd.data(), initrd.size());
 
-    auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start,
-                                    initrd_addr, initrd.size());
+    // auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start,
+    //                                 initrd_addr, initrd.size());
+    auto params = build_boot_params(img, layout::MEM_SIZE, cmdline, layout::CMDLINE.start);
 
 
     mem.write(layout::BOOT_PARAMS.start, params.data(), params.size());
