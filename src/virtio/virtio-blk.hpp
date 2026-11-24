@@ -80,7 +80,10 @@ private:
             // read and write for the block device
             std::vector<Buffer> bufs = vq.collect(head);   // throws on bad GPA / loop -> transport needs_reset
 
-            // chain must be: header (readable, >=16B) ... status (writable, >=1B)
+            // The chain must be header + data segments + status
+            // front should not be writable.
+            // back should be writable. 
+            // header should be 16 bytes.
             if (bufs.size() < 2 || bufs.front().writable || bufs.front().len < 16 ||
                 !bufs.back().writable || bufs.back().len < 1)
                 throw std::runtime_error("virtio-blk: malformed request chain");

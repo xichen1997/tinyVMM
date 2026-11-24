@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
 
     // load kernel.bin
     BzImage img = load_bzimage("kernel.bin");
-    std::string cmdline = "console=hvc0 reboot=k panic=1 pci=off rdinit=/init virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
+    std::string cmdline = "console=hvc0 reboot=k panic=1 pci=off root=/dev/vda rw rootfstype=ext4 init=/init virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
 
     mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
     mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
