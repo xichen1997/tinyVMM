@@ -22,6 +22,7 @@
 #include <thread>
 
 
+#include "vmm/fd.hpp"
 #include "vmm/gdt.hpp"
 
 #include "vmm/guest_memory.hpp"
@@ -42,6 +43,7 @@
 // virtio, virtio already includes virtqueue.hpp
 #include "virtio/virtio.hpp"
 #include "virtio/virtio-console.hpp"
+#include "virtio/virtio-blk.hpp"
 
 static void on_sigint(int) {}   
 
@@ -89,45 +91,6 @@ constexpr bool all_in_memory() {
         if (r.end() > layout::MEM_SIZE) return false;
     return true;
 }
-
-
-class FD {
-    private:
-    int fd;
-    public:
-    // constructor
-    explicit FD(int fd) noexcept : fd(fd) {}
-
-    // open file
-    static FD open_file(const char* path, int flags) {
-        int fd = ::open(path, flags | O_CLOEXEC);
-        if (fd == -1) {
-            throw std::runtime_error("Failed to open file: " + std::string(path));
-        }
-        return FD{fd};
-    }
-
-    // delete copy constructor and assignment operator
-    FD(const FD&) = delete;
-    FD& operator=(const FD&) = delete;
-
-    // move constructor and assignment operator
-    FD(FD&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
-    FD& operator=(FD&& o) noexcept {
-        if (this != &o) {
-            if (fd >= 0) ::close(fd);
-            fd = std::exchange(o.fd, -1);
-        }
-        return *this;
-    }
-    // get fd
-    int get() const { return fd; }
-    
-    // destructor
-    ~FD() { 
-        if (fd >= 0) ::close(fd); 
-    }
-};
 
 
 class KVM {
@@ -288,7 +251,7 @@ int main(int argc, char** argv) {
 
     // load kernel.bin
     BzImage img = load_bzimage("kernel.bin");
-    std::string cmdline = "console=hvc0 reboot=k panic=1 pci=off rdinit=/bin/sh virtio_mmio.device=4K@0xd0000000:5";
+    std::string cmdline = "console=hvc0 reboot=k panic=1 pci=off rdinit=/init virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
 
     mem.write(layout::KERNEL.start, img.kernel.data(), img.kernel.size());
     mem.write(layout::CMDLINE.start, cmdline.c_str(), cmdline.size() + 1);   // with '\0'
@@ -400,9 +363,23 @@ int main(int argc, char** argv) {
         irq5 = level;
     };
 
+    bool irq6 = false;
+    auto raise_irq6 = [&](bool level) {        // must hold dev_lock when calling
+        if (level == irq6) return;
+        kvm_irq_level line{};
+        line.irq = 6;                           // virtio-blk uses IRQ 6
+        line.level = level;
+        if (ioctl(vm.get(), KVM_IRQ_LINE, &line) < 0)
+            throw std::system_error(errno, std::generic_category(), "KVM_IRQ_LINE");
+        irq6 = level;
+    };
+
     VirtioConsole console;
+    VirtioBlk blk(FD::open_file("disk.img", O_RDWR));
     VirtioMmioTransport transport_console(console, raise_irq5, mem);
+    VirtioMmioTransport transport_blk(blk, raise_irq6, mem);
     mmio.add(0xd0000000, 0x1000, &transport_console);
+    mmio.add(0xd0001000, 0x1000, &transport_blk);
 
     // set stdin to raw mode, each key is directly passed to the guest. press Ctrl-A then x to exit.
     RawTerminal term;

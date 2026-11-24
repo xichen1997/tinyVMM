@@ -1,5 +1,6 @@
 #pragma once
 #include "virtio/virtio.hpp"
+#include <iostream>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

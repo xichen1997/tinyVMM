@@ -10,9 +10,21 @@ find_program(LD NAMES ld REQUIRED)
 
 set(GUEST_BIN ${CMAKE_CURRENT_BINARY_DIR}/guest.bin)
 set(GUEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/guest)
+set(DISK_IMG ${CMAKE_CURRENT_BINARY_DIR}/disk.img)
 
 # project headers are included as "<module>/<file>.hpp", rooted at src/
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# find a mkfs.ext4
+find_program(MKFS_EXT4 NAMES mkfs.ext4 PATHS /sbin /usr/sbin REQUIRED)
+add_custom_command(
+    OUTPUT ${DISK_IMG}
+    COMMAND truncate -s 256M ${DISK_IMG}
+    COMMAND ${MKFS_EXT4} -q -F ${DISK_IMG}
+    COMMENT "Creating disk.img (256M ext4)"
+    VERBATIM
+)
+add_custom_target(disk DEPENDS ${DISK_IMG})
 
 # --- guest: freestanding C → ELF → flat binary (linked at 0x10000) ---
 add_custom_command(
